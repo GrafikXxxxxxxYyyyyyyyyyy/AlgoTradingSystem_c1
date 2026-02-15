@@ -23,18 +23,6 @@ from .processors import (
     RawTradesProcessor,
     OrderbookProcessor,
 )
-try:
-    from .stream_state import (
-        StreamFeatureEngine,
-        sync_engine_from_agg_trades,
-        sync_engine_from_agg_trades_incremental,
-        sync_engine_from_orderbook_long,
-    )
-except ImportError:
-    StreamFeatureEngine = None  # type: ignore
-    sync_engine_from_agg_trades = None  # type: ignore
-    sync_engine_from_agg_trades_incremental = None  # type: ignore
-    sync_engine_from_orderbook_long = None  # type: ignore
 
 
 def process_raw_stream(
@@ -170,36 +158,6 @@ def get_processed_data(
     else:
         raise ValueError(f"Unknown source: {source}")
 
-
-def get_latest_feature_row_live(
-    live_collector: LiveCollector,
-    stream_engine: Optional[StreamFeatureEngine] = None,
-    orderbook_levels: int = 100,
-    grid_ms: int = 100,
-    last_synced_agg_ts: Optional[int] = None,
-    last_synced_ob_ts: Optional[int] = None,
-) -> Tuple[pd.DataFrame, StreamFeatureEngine, int, int]:
-    """
-    Быстрый путь для live/demo: одна строка фичей из текущего состояния коллектора
-    без полного merged DataFrame. При передаче last_synced_* синхронизируются только
-    новые данные (инкрементально). Возвращает (1-row DataFrame, engine, new_agg_ts, new_ob_ts).
-    """
-    if stream_engine is None:
-        stream_engine = StreamFeatureEngine(orderbook_levels=orderbook_levels, grid_ms=grid_ms)
-    agg = live_collector.get_dataframe("aggTrades")
-    new_agg_ts = sync_engine_from_agg_trades_incremental(stream_engine, agg, last_synced_ts=last_synced_agg_ts)
-    ob = live_collector.get_dataframe("orderbook_snapshots")
-    new_ob_ts = last_synced_ob_ts if last_synced_ob_ts is not None else 0
-    if ob is not None and not (hasattr(ob, "empty") and ob.empty) and hasattr(ob, "columns") and "exchange_ts" in ob.columns:
-        ob_max = int(ob["exchange_ts"].max())
-        if last_synced_ob_ts is None or ob_max > last_synced_ob_ts:
-            sync_engine_from_orderbook_long(stream_engine, ob, n_levels=orderbook_levels)
-            new_ob_ts = ob_max
-    elif last_synced_ob_ts is None and ob is not None and not getattr(ob, "empty", True):
-        sync_engine_from_orderbook_long(stream_engine, ob, n_levels=orderbook_levels)
-        new_ob_ts = int(ob["exchange_ts"].max()) if hasattr(ob, "columns") and "exchange_ts" in ob.columns else 0
-    row = stream_engine.get_feature_row()
-    return pd.DataFrame([row]), stream_engine, new_agg_ts, new_ob_ts
 
 
 def calculate_features(raw: pd.DataFrame, filename: str = "all_features") -> pd.DataFrame:

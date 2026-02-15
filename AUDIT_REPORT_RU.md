@@ -8,33 +8,7 @@
 
 ## 1. Критические ошибки (проект не запускается)
 
-### 1.1 Отсутствующие модули в `src/mlcore/`
-
-**Файл:** `src/mlcore/dataloader.py`
-
-Импортируются модули, которых **нет в репозитории**:
-
-- `from .config import DataGridConfig, GRID_100MS, GRID_5S` — **файла `config.py` в `mlcore/` нет**
-- `from .grid import build_canonical_grid, _to_datetime_index` — **файла `grid.py` нет**
-- `from .stream_state import StreamFeatureEngine, sync_engine_from_agg_trades, sync_engine_from_agg_trades_incremental, sync_engine_from_orderbook_long` — **файла `stream_state.py` нет**
-
-**Следствие:** при любом импорте `dataloader` (ноутбуки, demo/live трейдеры) будет `ModuleNotFoundError`.
-
----
-
-### 1.2 Отсутствующий модуль `predict_fast`
-
-**Файлы:** `src/trading/demo_trader.py`, `src/trading/live_trader.py`
-
-- `from src.mlcore.predict_fast import get_model_feature_columns, predict_mid_spread_fast`
-
-**Модуля `src/mlcore/predict_fast.py` в проекте нет.**
-
-**Следствие:** запуск DemoTrader/LiveTrader в режиме `use_stream_path=True` или при первом импорте приведёт к ошибке импорта.
-
----
-
-### 1.3 Неверный импорт в `collector.py`
+### 1.1 Неверный импорт в `collector.py`
 
 **Файл:** `src/parser/collector.py`, строка 114
 
