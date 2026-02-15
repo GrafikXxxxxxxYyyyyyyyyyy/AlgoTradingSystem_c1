@@ -9,11 +9,23 @@ from typing import Optional
 
 class BaseProcessor(ABC):
     """
-    grid_resolution_ms: интервал сетки в мс (5000 = 5s, 100 = 100ms). None = тиковый режим.
+    grid_resolution_ms: интервал сетки в миллисекундах (5000 = 5 s, 10000 = 10 s, 100 = 100 ms). None = тиковый режим.
     """
     def __init__(self, grid_resolution_ms: Optional[int] = 5000):
         self.prev_df = None
-        self.grid_resolution_ms = grid_resolution_ms
+        self._grid_value = grid_resolution_ms
+        if grid_resolution_ms is not None:
+            self._rule_ns = int(grid_resolution_ms * 1_000_000)
+            self._resample_rule = f"{int(grid_resolution_ms)}ms"
+        else:
+            self._rule_ns = None
+            self._resample_rule = None
+
+    def _round_index_ns_to_grid(self, right_edge_ns: np.ndarray) -> np.ndarray:
+        """Округляет границы бинов до шага сетки (rule_ns), чтобы индексы совпадали при мерже (одна строка на интервал)."""
+        if self._rule_ns is None:
+            return right_edge_ns
+        return (right_edge_ns // self._rule_ns) * self._rule_ns
 
     @abstractmethod
     def create_features(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -22,37 +34,42 @@ class BaseProcessor(ABC):
         """
         pass
 
-    def __call__(self, stream_df: pd.DataFrame, need_prev_hour: bool = False, **kwargs):
-        # приводим временную метку к читаемому формату
-        stream_df['exchange_ts'] = pd.to_datetime(stream_df['exchange_ts'], unit='ms')
+    def __call__(
+        self,
+        stream_df: pd.DataFrame,
+        need_prev_hour: bool = False,
+        keep_ts_range: Optional[tuple] = None,
+        **kwargs,
+    ):
+        """
+        keep_ts_range: (t_min, t_max) — оставить только строки с exchange_ts в этом диапазоне (включительно).
+        Используется при обработке по файлам с перекрытием: в stream_df уже лежит tail_prev + current + head_next.
+        """
+        stream_df = stream_df.copy()
+        stream_df["exchange_ts"] = pd.to_datetime(stream_df["exchange_ts"], unit="ms")
 
-        # Сохраняем временную метку для разделения 
-        split_index = stream_df['exchange_ts'].iloc[0]
+        split_index = stream_df["exchange_ts"].iloc[0]
 
-        # Если нужно объединять с предыдущим часом
         if need_prev_hour:
             if self.prev_df is not None:
                 df_combined = pd.concat([self.prev_df, stream_df], ignore_index=True)
             else:
-                df_combined = stream_df.copy()
-
+                df_combined = stream_df
             self.prev_df = stream_df.copy()
         else:
-            df_combined = stream_df.copy()
+            df_combined = stream_df
 
-        # Устанавливаем временную метку как индекс 
-        df_combined.set_index('exchange_ts', inplace=True)
-
-        # Рассчитываем фичи
+        df_combined.set_index("exchange_ts", inplace=True)
         df_features = self.create_features(df_combined)
-
-        # Возвращаем временную метку как колонку
         df_features.reset_index(inplace=True)
 
-        # Отрезаем предыдущий час
-        result = df_features.loc[df_features['exchange_ts'] >= split_index]
-
-        return result
+        if keep_ts_range is not None:
+            t_lo, t_hi = keep_ts_range
+            mask = (df_features["exchange_ts"] >= t_lo) & (df_features["exchange_ts"] <= t_hi)
+            return df_features.loc[mask]
+        if need_prev_hour:
+            return df_features.loc[df_features["exchange_ts"] >= split_index]
+        return df_features
     
 
 
@@ -60,14 +77,14 @@ class AggTradesProcessor(BaseProcessor):
     def create_features(self, df_combined: pd.DataFrame) -> pd.DataFrame:
         df_combined = df_combined.sort_index()
 
-        if self.grid_resolution_ms is not None:
+        if self._rule_ns is not None:
             # OHLCV через группировку по bin (numpy + reduceat) вместо pandas resample
             t_ns = df_combined.index.astype(np.int64)
             price = np.asarray(df_combined["price"], dtype=np.float64)
             qty = np.asarray(df_combined["qty"], dtype=np.float64)
 
             t_min = t_ns.min()
-            rule_ns = int(self.grid_resolution_ms) * 1_000_000  # ms -> ns
+            rule_ns = self._rule_ns
             bin_id = (t_ns - t_min) // rule_ns
 
             order = np.argsort(bin_id)
@@ -85,6 +102,7 @@ class AggTradesProcessor(BaseProcessor):
             volume = np.add.reduceat(qty_sorted, start_idx)
 
             right_edge_ns = t_min + (unique_bins + 1) * rule_ns
+            right_edge_ns = self._round_index_ns_to_grid(right_edge_ns)
             index = pd.to_datetime(right_edge_ns, unit="ns")
             index.name = "exchange_ts"
 
@@ -191,14 +209,20 @@ class RawTradesProcessor(BaseProcessor):
 
         features_df = pd.DataFrame(feature_dict, index=df.index)
 
-        if self.grid_resolution_ms is not None:
-            rule = f"{self.grid_resolution_ms}ms"
+        if self._resample_rule is not None:
             features_df = (
                 features_df
-                .resample(rule, closed="left", label="right")
+                .resample(self._resample_rule, closed="left", label="right")
                 .last()
                 .ffill()
             )
+            # Выравниваем индекс по шагу сетки (как в AggTrades/Orderbook), иначе при мерже появятся лишние строки
+            index_ns = features_df.index.astype(np.int64)
+            features_df.index = pd.to_datetime(
+                self._round_index_ns_to_grid(index_ns), unit="ns"
+            )
+            # После округления возможны дубли индекса — оставляем последнюю строку на каждый момент
+            features_df = features_df[~features_df.index.duplicated(keep="last")]
 
         return features_df
     
@@ -248,10 +272,10 @@ class OrderbookProcessor(BaseProcessor):
         index = pd.to_datetime(uniq_ts)
         index.name = "exchange_ts"
 
-        if self.grid_resolution_ms is not None:
+        if self._rule_ns is not None:
             t_ns = uniq_ts.astype(np.int64)
             t_min = t_ns.min()
-            rule_ns = int(self.grid_resolution_ms) * 1_000_000
+            rule_ns = self._rule_ns
             bin_id = (t_ns - t_min) // rule_ns
             order = np.argsort(bin_id)
             bin_sorted = bin_id[order]
@@ -261,6 +285,7 @@ class OrderbookProcessor(BaseProcessor):
             binned = wide[last_row_idx]
             binned_ffill = pd.DataFrame(binned).ffill().values
             right_edge_ns = t_min + (unique_bins + 1) * rule_ns
+            right_edge_ns = self._round_index_ns_to_grid(right_edge_ns)
             index = pd.to_datetime(right_edge_ns, unit="ns")
             index.name = "exchange_ts"
             wide = binned_ffill
