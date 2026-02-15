@@ -113,7 +113,7 @@ class BinanceFuturesCollector:
         logger.info("🔍 Recovering data from WAL files...")
         recovered_count = 0
         for stream_type in self.storage._schemas.keys():
-            from storage import WALLogger
+            from .storage import WALLogger
             wal_logger = WALLogger(self.cfg.data_dir, self.symbol, stream_type)
             records = list(wal_logger.read_all())
             if not records:

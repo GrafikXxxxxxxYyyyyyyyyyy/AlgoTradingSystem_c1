@@ -4,12 +4,16 @@ import numpy as np
 import pandas as pd
 
 from abc import ABC, abstractmethod
-
+from typing import Optional
 
 
 class BaseProcessor(ABC):
-    def __init__(self):
+    """
+    grid_resolution_ms: интервал сетки в мс (5000 = 5s, 100 = 100ms). None = тиковый режим.
+    """
+    def __init__(self, grid_resolution_ms: Optional[int] = 5000):
         self.prev_df = None
+        self.grid_resolution_ms = grid_resolution_ms
 
     @abstractmethod
     def create_features(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -18,7 +22,7 @@ class BaseProcessor(ABC):
         """
         pass
 
-    def __call__(self, stream_df: pd.DataFrame, need_prev_hour: bool = False):
+    def __call__(self, stream_df: pd.DataFrame, need_prev_hour: bool = False, **kwargs):
         # приводим временную метку к читаемому формату
         stream_df['exchange_ts'] = pd.to_datetime(stream_df['exchange_ts'], unit='ms')
 
@@ -56,14 +60,20 @@ class AggTradesProcessor(BaseProcessor):
     def create_features(self, df_combined: pd.DataFrame) -> pd.DataFrame:
         # Сортируем по времени
         df_combined = df_combined.sort_index()
-        
-        # Получаем 1-минутные свечи
-        ohlcv_5s = df_combined['price'].resample('5s', closed='left', label='right').ohlc()
-        volume_5s = df_combined['qty'].resample('5s', closed='left', label='right').sum()
-        ohlcv_5s['volume'] = volume_5s
 
-        # Создаём датафрейм для добавления технических индикаторов и осцилляторов
-        df = ohlcv_5s.copy()
+        if self.grid_resolution_ms is not None:
+            # Ресэмплинг на сетку (5s, 1s, 100ms, 50ms и т.д.)
+            rule = f"{self.grid_resolution_ms}ms"
+            ohlcv = df_combined["price"].resample(rule, closed="left", label="right").ohlc()
+            volume = df_combined["qty"].resample(rule, closed="left", label="right").sum()
+            ohlcv["volume"] = volume
+            df = ohlcv.copy()
+        else:
+            # Тиковый режим: одна строка на каждую сделку (без потери данных)
+            df = df_combined[["price", "qty"]].copy()
+            df["open"] = df["high"] = df["low"] = df["close"] = df["price"]
+            df["volume"] = df["qty"]
+            df = df[["open", "high", "low", "close", "volume"]]
 
         return df
     
@@ -145,14 +155,16 @@ class RawTradesProcessor(BaseProcessor):
             feature_dict[f'agg_imbalance_{win}'] = agg_imbalance
 
         features_df = pd.DataFrame(feature_dict, index=df.index)
-        
-        # Ресемплируем к 1-секундной сетке
-        features_df = (
-            features_df
-            .resample('5s', closed='left', label='right')
-            .last()
-            .ffill()
-        )
+
+        # Ресэмплинг на сетку только если задана (иначе тиковый режим — все строки сохраняются)
+        if self.grid_resolution_ms is not None:
+            rule = f"{self.grid_resolution_ms}ms"
+            features_df = (
+                features_df
+                .resample(rule, closed="left", label="right")
+                .last()
+                .ffill()
+            )
 
         return features_df
     
@@ -175,15 +187,20 @@ class OrderbookProcessor(BaseProcessor):
         # Пивотим по exchange_ts (индекс уже установлен)
         bid_piv = bids.pivot_table(
             index=bids.index,
-            columns='level',
-            values=['price', 'qty'],
-        ).resample('5s', closed='left', label='right').last().ffill()
-
+            columns="level",
+            values=["price", "qty"],
+        )
         ask_piv = asks.pivot_table(
             index=asks.index,
-            columns='level',
-            values=['price', 'qty'],
-        ).resample('5s', closed='left', label='right').last().ffill()
+            columns="level",
+            values=["price", "qty"],
+        )
+
+        # Ресэмплинг на сетку только если задана (иначе тиковый режим — каждое обновление стакана)
+        if self.grid_resolution_ms is not None:
+            rule = f"{self.grid_resolution_ms}ms"
+            bid_piv = bid_piv.resample(rule, closed="left", label="right").last().ffill()
+            ask_piv = ask_piv.resample(rule, closed="left", label="right").last().ffill()
 
         # Убираем мультииндекс у колонок
         bid_piv.columns = [f"bid_{col[0]}_{col[1]}" for col in bid_piv.columns]
