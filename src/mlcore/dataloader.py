@@ -2,7 +2,9 @@
 Загрузка и объединение потоков по единой временной сетке.
 Поддержка тиковой/высокочастотной дискретизации (50–100 ms) без потери данных.
 Данные только из parquet: local (merged.parquet) или raw (parquet по потокам в data/data_{symbol}/).
+Кэш: при source="raw" сохраняется список обработанных файлов; при повторном вызове обрабатываются только новые файлы и результат склеивается с кэшем без потери данных.
 """
+import json
 import os
 import glob
 import inspect
@@ -11,10 +13,12 @@ import importlib.util
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-from typing import Optional, Tuple, Any
+from typing import Optional, Tuple, Any, Dict, List
 
 # Чтобы различать "параметр не передан" и "передан None" (тиковый режим)
 _RESOLUTION_UNSET: Any = object()
+
+PROCESSED_META_FILENAME = "processed_meta.json"
 
 from src.parser.live_collector import LiveCollector
 from .processors import (
@@ -29,6 +33,39 @@ def _rule_ns_from_resolution(resolution_kw: dict) -> Optional[int]:
     """Шаг сетки в наносекундах из resolution_kw (grid_resolution_ms); None = тиковый режим."""
     v = resolution_kw.get("grid_resolution_ms")
     return int(v * 1_000_000) if v is not None else None
+
+
+def _list_raw_files_per_stream(
+    symbol: str, data_dir: str, drop_last: bool
+) -> Dict[str, List[str]]:
+    """Список parquet-файлов по потокам (aggTrades, rawTrades, orderbook_snapshots)."""
+    streams = ["aggTrades", "rawTrades", "orderbook_snapshots"]
+    out = {}
+    for stream_name in streams:
+        base = os.path.join(data_dir, f"data_{symbol}", stream_name)
+        files = sorted(glob.glob(os.path.join(base, f"{symbol}_{stream_name}_*.parquet")))
+        if drop_last and len(files) > 0:
+            files = files[:-1]
+        out[stream_name] = files
+    return out
+
+
+def _load_processed_meta(save_dir: str) -> Optional[dict]:
+    path = os.path.join(save_dir, PROCESSED_META_FILENAME)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _save_processed_meta(save_dir: str, meta: dict) -> None:
+    os.makedirs(save_dir, exist_ok=True)
+    path = os.path.join(save_dir, PROCESSED_META_FILENAME)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
 
 
 def _reindex_to_regular_grid(df: pd.DataFrame, rule_ns: int) -> pd.DataFrame:
@@ -52,19 +89,24 @@ def process_raw_stream(
     data_dir: str = "data",
     save_dir: str = "features/",
     drop_last: bool = True,
+    files_override: Optional[List[str]] = None,
 ) -> pd.DataFrame:
     """
     Читает parquet-файлы потока и обрабатывает процессором.
+    files_override: если задан, использовать этот список путей вместо glob (для инкрементальной подгрузки; при этом drop_last не применяется к списку).
     При заданной сетке (rule_ns): каждый файл обрабатывается с минимальным перекрытием
     (хвост предыдущего + текущий + голова следующего), затем оставляются только строки,
     принадлежащие текущему файлу. Данные на стыках не теряются, каждый файл читается один раз.
     """
-    base = os.path.join(data_dir, f"data_{symbol}", stream_name)
-    files = sorted(glob.glob(os.path.join(base, f"{symbol}_{stream_name}_*.parquet")))
+    if files_override is not None:
+        files = list(files_override)
+    else:
+        base = os.path.join(data_dir, f"data_{symbol}", stream_name)
+        files = sorted(glob.glob(os.path.join(base, f"{symbol}_{stream_name}_*.parquet")))
+        if drop_last and len(files) > 0:
+            files = files[:-1]
     if not files:
         return pd.DataFrame()
-    if drop_last and len(files) > 0:
-        files = files[:-1]
 
     rule_ns = getattr(processor, "_rule_ns", None)
 
@@ -185,6 +227,98 @@ def get_processed_data(
     }
 
     if source == "raw":
+        resolution_ms = resolution_kw.get("grid_resolution_ms")
+        current_files = _list_raw_files_per_stream(symbol, data_dir, drop_last)
+        path_merged = os.path.join(save_dir, "merged.parquet")
+        meta = _load_processed_meta(save_dir)
+
+        # Кэш подходит только если symbol и grid совпадают
+        cache_ok = (
+            meta is not None
+            and os.path.isfile(path_merged)
+            and meta.get("symbol") == symbol
+            and meta.get("grid_resolution_ms") == resolution_ms
+        )
+
+        if cache_ok:
+            processed = meta.get("streams") or {}
+            # Все потоки совпадают с текущим списком файлов — возвращаем кэш без перечитывания
+            if all(
+                current_files.get(s, []) == processed.get(s, [])
+                for s in processors
+            ):
+                out = pd.read_parquet(path_merged)
+                rule_ns = _rule_ns_from_resolution(resolution_kw)
+                if rule_ns is not None and not out.empty:
+                    out = _reindex_to_regular_grid(out, rule_ns)
+                return out
+
+            # Инкремент: обрабатываем только last_processed + new_files по каждому потоку
+            incremental_files: Dict[str, List[str]] = {}
+            for stream_name in processors:
+                cur = current_files.get(stream_name, [])
+                prev = processed.get(stream_name, [])
+                if not cur:
+                    incremental_files[stream_name] = []
+                    continue
+                if cur == prev:
+                    incremental_files[stream_name] = prev[-1:] if prev else []
+                    continue
+                # cur — надмножество/продолжение: prev — префикс cur?
+                if prev and cur[: len(prev)] == prev:
+                    new_list = prev[-1:] + cur[len(prev) :]
+                else:
+                    new_list = cur
+                incremental_files[stream_name] = new_list
+
+            # Обрабатываем только заданные файлы (без drop_last по списку)
+            df_features = []
+            for stream_name, processor in processors.items():
+                flist = incremental_files.get(stream_name) or current_files.get(stream_name, [])
+                if not flist:
+                    df_features.append(pd.DataFrame())
+                    continue
+                stream_df = process_raw_stream(
+                    stream_name=stream_name,
+                    processor=processor,
+                    symbol=symbol,
+                    data_dir=data_dir,
+                    save_dir=save_dir,
+                    drop_last=drop_last,
+                    files_override=flist,
+                )
+                df_features.append(stream_df)
+
+            if not df_features or all(d.empty for d in df_features):
+                out = pd.read_parquet(path_merged)
+            else:
+                # Склеиваем кэш и новый кусок: новый перекрывает границу, дубликаты — keep last
+                out_new = df_features[0]
+                for df in df_features[1:]:
+                    if df.empty:
+                        continue
+                    out_new = pd.merge(out_new, df, on="exchange_ts", how="outer", suffixes=("", "_y"))
+                    out_new = out_new[[c for c in out_new.columns if not c.endswith("_y")]]
+                out_new = out_new.sort_values("exchange_ts").drop_duplicates(subset="exchange_ts", keep="last")
+                out_new = out_new.ffill()
+
+                cached = pd.read_parquet(path_merged)
+                out = pd.concat([cached, out_new], ignore_index=True)
+                out = out.sort_values("exchange_ts").drop_duplicates(subset="exchange_ts", keep="last")
+                out = out.ffill()
+
+            rule_ns = _rule_ns_from_resolution(resolution_kw)
+            if rule_ns is not None and not out.empty:
+                out = _reindex_to_regular_grid(out, rule_ns)
+            os.makedirs(save_dir, exist_ok=True)
+            out.to_parquet(path_merged)
+            for stream_name, d in zip(processors.keys(), df_features):
+                if not d.empty:
+                    d.to_parquet(os.path.join(save_dir, f"{stream_name}.parquet"))
+            meta["streams"] = current_files
+            _save_processed_meta(save_dir, meta)
+            return out
+        # Полная обработка без кэша или при несовпадении symbol/grid
         df_features = []
         for stream_name, processor in processors.items():
             stream_df = process_raw_stream(
@@ -200,7 +334,6 @@ def get_processed_data(
         if not df_features or all(d.empty for d in df_features):
             return pd.DataFrame()
 
-        # Outer merge: keep every timestamp from every stream (no data loss)
         out = df_features[0]
         for df in df_features[1:]:
             if df.empty:
@@ -209,15 +342,18 @@ def get_processed_data(
             out = out[[c for c in out.columns if not c.endswith("_y")]]
         out = out.sort_values("exchange_ts").drop_duplicates(subset="exchange_ts", keep="last")
         out = out.ffill()
-        # Приводим к регулярной сетке с шагом rule_ns (50 ms, 5000 ms и т.д.), чтобы не было скачков 50/100 ms
         rule_ns = _rule_ns_from_resolution(resolution_kw)
         if rule_ns is not None and not out.empty:
             out = _reindex_to_regular_grid(out, rule_ns)
         os.makedirs(save_dir, exist_ok=True)
-        out.to_parquet(os.path.join(save_dir, "merged.parquet"))
+        out.to_parquet(path_merged)
         for stream_name, d in zip(processors.keys(), df_features):
             if not d.empty:
                 d.to_parquet(os.path.join(save_dir, f"{stream_name}.parquet"))
+        _save_processed_meta(
+            save_dir,
+            {"symbol": symbol, "grid_resolution_ms": resolution_ms, "streams": current_files},
+        )
         return out
 
     elif source == "local":
