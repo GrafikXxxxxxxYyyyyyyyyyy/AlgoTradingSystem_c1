@@ -58,18 +58,41 @@ class BaseProcessor(ABC):
 
 class AggTradesProcessor(BaseProcessor):
     def create_features(self, df_combined: pd.DataFrame) -> pd.DataFrame:
-        # Сортируем по времени
         df_combined = df_combined.sort_index()
 
         if self.grid_resolution_ms is not None:
-            # Ресэмплинг на сетку (5s, 1s, 100ms, 50ms и т.д.)
-            rule = f"{self.grid_resolution_ms}ms"
-            ohlcv = df_combined["price"].resample(rule, closed="left", label="right").ohlc()
-            volume = df_combined["qty"].resample(rule, closed="left", label="right").sum()
-            ohlcv["volume"] = volume
-            df = ohlcv.copy()
+            # OHLCV через группировку по bin (numpy + reduceat) вместо pandas resample
+            t_ns = df_combined.index.astype(np.int64)
+            price = np.asarray(df_combined["price"], dtype=np.float64)
+            qty = np.asarray(df_combined["qty"], dtype=np.float64)
+
+            t_min = t_ns.min()
+            rule_ns = int(self.grid_resolution_ms) * 1_000_000  # ms -> ns
+            bin_id = (t_ns - t_min) // rule_ns
+
+            order = np.argsort(bin_id)
+            bin_sorted = bin_id[order]
+            price_sorted = price[order]
+            qty_sorted = qty[order]
+
+            unique_bins, start_idx = np.unique(bin_sorted, return_index=True)
+            end_idx = np.concatenate([start_idx[1:], [len(bin_sorted)]])
+
+            open_ = price_sorted[start_idx]
+            close = price_sorted[end_idx - 1]
+            high = np.maximum.reduceat(price_sorted, start_idx)
+            low = np.minimum.reduceat(price_sorted, start_idx)
+            volume = np.add.reduceat(qty_sorted, start_idx)
+
+            right_edge_ns = t_min + (unique_bins + 1) * rule_ns
+            index = pd.to_datetime(right_edge_ns, unit="ns")
+            index.name = "exchange_ts"
+
+            df = pd.DataFrame(
+                {"open": open_, "high": high, "low": low, "close": close, "volume": volume},
+                index=index,
+            )
         else:
-            # Тиковый режим: одна строка на каждую сделку (без потери данных)
             df = df_combined[["price", "qty"]].copy()
             df["open"] = df["high"] = df["low"] = df["close"] = df["price"]
             df["volume"] = df["qty"]
@@ -81,82 +104,93 @@ class AggTradesProcessor(BaseProcessor):
 
 class RawTradesProcessor(BaseProcessor):
     def create_features(self, df_combined: pd.DataFrame) -> pd.DataFrame:
-        # Сортируем по времени
+        """
+        Векторизованный расчёт rolling-фичей по времени (cumsum + searchsorted)
+        вместо 12 отдельных pandas rolling — сохраняет логику и результат.
+        """
         df_combined = df_combined.sort_index()
-        # Отавляем только нужные колонки
-        df = df_combined[['isBuyerMaker', 'qty', 'price']].copy()
+        df = df_combined[["isBuyerMaker", "qty", "price"]].copy()
 
-        df['buy_qty'] = np.where(~df['isBuyerMaker'], df['qty'], 0.0)
-        df['sell_qty'] = np.where(df['isBuyerMaker'], df['qty'], 0.0)
-        df['is_aggressive_buy'] = (~df['isBuyerMaker']).astype(int)  # агрессивные покупки (берут ask)
-        df['is_aggressive_sell'] = df['isBuyerMaker'].astype(int)     # агрессивные продажи (берут bid)
+        is_buy = ~df["isBuyerMaker"].values
+        qty = np.asarray(df["qty"], dtype=np.float64)
+        price = np.asarray(df["price"], dtype=np.float64)
 
-        qty = df['qty']
-        price = df['price']
-        buy_qty = df['buy_qty']
-        sell_qty = df['sell_qty']
-        aggressive_buy = df['is_aggressive_buy']
-        aggressive_sell = df['is_aggressive_sell']
+        buy_qty = np.where(is_buy, qty, 0.0)
+        sell_qty = np.where(is_buy, 0.0, qty)
+        aggressive_buy = np.where(is_buy, 1, 0).astype(np.float64)
+        aggressive_sell = np.where(is_buy, 0, 1).astype(np.float64)
         price_vol = price * qty
 
-        windows_sec = [1,2,3,5,10,15,20,30,45,60,90,120]
+        # Время в секундах для окон
+        t_sec = df.index.astype(np.int64) / 1e9
+        n = len(t_sec)
+
+        # Кумулятивные суммы (с нулём в начале для суммы на [left_idx, i))
+        def _cs(x):
+            out = np.empty(n + 1, dtype=np.float64)
+            out[0] = 0
+            np.cumsum(x, out=out[1:])
+            return out
+
+        cs_qty = _cs(qty)
+        cs_buy = _cs(buy_qty)
+        cs_sell = _cs(sell_qty)
+        cs_pv = _cs(price_vol)
+        cs_agg_buy = _cs(aggressive_buy)
+        cs_agg_sell = _cs(aggressive_sell)
+        cs_price = _cs(price)
+        cs_price2 = _cs(price * price)
+
+        windows_sec = [1, 2, 3, 5, 10, 15, 20, 30, 45, 60, 90, 120]
         feature_dict = {}
 
         for win_sec in windows_sec:
             win = f"{win_sec}s"
+            # Левая граница окна [t - win_sec, t) для каждой строки (closed='left')
+            left_idx = np.searchsorted(t_sec, t_sec - win_sec, side="left")
+            left_idx = np.maximum(left_idx, 0)
 
-            # Rolling windows (только прошлое)
-            r_qty = qty.rolling(win, closed='left')
-            r_buy = buy_qty.rolling(win, closed='left')
-            r_sell = sell_qty.rolling(win, closed='left')
-            r_price = price.rolling(win, closed='left')
-            r_vol = price_vol.rolling(win, closed='left')
-            r_agg_buy = aggressive_buy.rolling(win, closed='left')
-            r_agg_sell = aggressive_sell.rolling(win, closed='left')
+            # Сумма на [left_idx[i], i) = cumsum[i] - cumsum[left_idx[i]]
+            total_vol = cs_qty[:n] - cs_qty[left_idx]
+            buy_vol = cs_buy[:n] - cs_buy[left_idx]
+            sell_vol = cs_sell[:n] - cs_sell[left_idx]
+            n_trades = np.arange(n, dtype=np.float64) - left_idx.astype(np.float64)
+            n_trades = np.maximum(n_trades, 0)
 
-            # === 1. Базовые объемы ===
-            total_vol = r_qty.sum()
-            buy_vol = r_buy.sum()
-            sell_vol = r_sell.sum()
-
-            # === 2. Дисбалансы ===
             vol_imbalance = (buy_vol - sell_vol) / (total_vol + 1e-12)
 
-            # === 3. Интенсивность сделок ===
-            n_trades = r_qty.count()
-            trade_freq = n_trades / win_sec
+            trade_freq = n_trades / (win_sec + 1e-12)
 
-            # === 4. VWAP и отклонения ===
-            vwap = r_vol.sum() / (total_vol + 1e-12)
+            vwap_num = cs_pv[:n] - cs_pv[left_idx]
+            vwap = vwap_num / (total_vol + 1e-12)
             vwap_dev = price - vwap
-            vwap_dev_norm = vwap_dev / (r_price.std() + 1e-12)
 
-            # === 6. Агрессивность ===
-            agg_buy_count = r_agg_buy.sum()
-            agg_sell_count = r_agg_sell.sum()
+            sum_price = cs_price[:n] - cs_price[left_idx]
+            sum_price2 = cs_price2[:n] - cs_price2[left_idx]
+            mean_p = sum_price / (n_trades + 1e-12)
+            var_p = sum_price2 / (n_trades + 1e-12) - mean_p * mean_p
+            std_p = np.sqrt(np.maximum(var_p, 0.0))
+            vwap_dev_norm = vwap_dev / (std_p + 1e-12)
+
+            agg_buy_count = cs_agg_buy[:n] - cs_agg_buy[left_idx]
+            agg_sell_count = cs_agg_sell[:n] - cs_agg_sell[left_idx]
             agg_imbalance = (agg_buy_count - agg_sell_count) / (n_trades + 1e-12)
 
-
-            # === Сохранение всех фич ===
-            feature_dict[f'volume_{win}'] = total_vol
-            feature_dict[f'buy_volume_{win}'] = buy_vol
-            feature_dict[f'sell_volume_{win}'] = sell_vol
-            feature_dict[f'volume_imbalance_{win}'] = vol_imbalance
-
-            feature_dict[f'n_trades_{win}'] = n_trades
-            feature_dict[f'trade_freq_{win}'] = trade_freq
-
-            feature_dict[f'vwap_{win}'] = vwap
-            feature_dict[f'vwap_dev_{win}'] = vwap_dev
-            feature_dict[f'vwap_dev_norm_{win}'] = vwap_dev_norm
-
-            feature_dict[f'agg_buy_count_{win}'] = agg_buy_count
-            feature_dict[f'agg_sell_count_{win}'] = agg_sell_count
-            feature_dict[f'agg_imbalance_{win}'] = agg_imbalance
+            feature_dict[f"volume_{win}"] = total_vol
+            feature_dict[f"buy_volume_{win}"] = buy_vol
+            feature_dict[f"sell_volume_{win}"] = sell_vol
+            feature_dict[f"volume_imbalance_{win}"] = vol_imbalance
+            feature_dict[f"n_trades_{win}"] = n_trades
+            feature_dict[f"trade_freq_{win}"] = trade_freq
+            feature_dict[f"vwap_{win}"] = vwap
+            feature_dict[f"vwap_dev_{win}"] = vwap_dev
+            feature_dict[f"vwap_dev_norm_{win}"] = vwap_dev_norm
+            feature_dict[f"agg_buy_count_{win}"] = agg_buy_count
+            feature_dict[f"agg_sell_count_{win}"] = agg_sell_count
+            feature_dict[f"agg_imbalance_{win}"] = agg_imbalance
 
         features_df = pd.DataFrame(feature_dict, index=df.index)
 
-        # Ресэмплинг на сетку только если задана (иначе тиковый режим — все строки сохраняются)
         if self.grid_resolution_ms is not None:
             rule = f"{self.grid_resolution_ms}ms"
             features_df = (
@@ -175,37 +209,61 @@ class OrderbookProcessor(BaseProcessor):
         """
         df_combined: long-format DataFrame с колонками:
             ['exchange_ts', 'side', 'level', 'price', 'qty']
+        Long -> wide через numpy; маппинг ts->row через np.unique; ресэмпл — через бинирование.
         """
-        # Отавляем только нужные колонки
-        df = df_combined[['side', 'level', 'price', 'qty']].copy()
+        df = df_combined[["side", "level", "price", "qty"]]
+        idx_values = df.index.values
+        uniq_ts, row_idx = np.unique(idx_values, return_inverse=True)
+        n_ts = len(uniq_ts)
+        n_levels = int(df["level"].max()) + 1
 
-        # ================ Преобразуем данные из long формата в numpy матрицы ================
-        # Разделяем bids и asks
-        bids = df[df['side'] == 'bid'][['price', 'qty', 'level']]
-        asks = df[df['side'] == 'ask'][['price', 'qty', 'level']]
+        bid_price = np.full((n_ts, n_levels), np.nan, dtype=np.float64)
+        bid_qty = np.full((n_ts, n_levels), np.nan, dtype=np.float64)
+        ask_price = np.full((n_ts, n_levels), np.nan, dtype=np.float64)
+        ask_qty = np.full((n_ts, n_levels), np.nan, dtype=np.float64)
 
-        # Пивотим по exchange_ts (индекс уже установлен)
-        bid_piv = bids.pivot_table(
-            index=bids.index,
-            columns="level",
-            values=["price", "qty"],
-        )
-        ask_piv = asks.pivot_table(
-            index=asks.index,
-            columns="level",
-            values=["price", "qty"],
-        )
+        lvl = df["level"].values.astype(np.intp)
+        prc = df["price"].values.astype(np.float64)
+        qty = df["qty"].values.astype(np.float64)
+        side_vals = df["side"].values
+        bid_mask = side_vals == "bid"
+        ask_mask = side_vals == "ask"
 
-        # Ресэмплинг на сетку только если задана (иначе тиковый режим — каждое обновление стакана)
+        flat_bid = row_idx[bid_mask] * n_levels + lvl[bid_mask]
+        flat_ask = row_idx[ask_mask] * n_levels + lvl[ask_mask]
+        np.put(bid_price, flat_bid, prc[bid_mask])
+        np.put(bid_qty, flat_bid, qty[bid_mask])
+        np.put(ask_price, flat_ask, prc[ask_mask])
+        np.put(ask_qty, flat_ask, qty[ask_mask])
+
+        n_cols = 4 * n_levels
+        wide = np.empty((n_ts, n_cols), dtype=np.float64)
+        wide[:, :n_levels] = bid_price
+        wide[:, n_levels : 2 * n_levels] = bid_qty
+        wide[:, 2 * n_levels : 3 * n_levels] = ask_price
+        wide[:, 3 * n_levels :] = ask_qty
+
+        bid_cols = [f"bid_price_{i}" for i in range(n_levels)] + [f"bid_qty_{i}" for i in range(n_levels)]
+        ask_cols = [f"ask_price_{i}" for i in range(n_levels)] + [f"ask_qty_{i}" for i in range(n_levels)]
+        index = pd.to_datetime(uniq_ts)
+        index.name = "exchange_ts"
+
         if self.grid_resolution_ms is not None:
-            rule = f"{self.grid_resolution_ms}ms"
-            bid_piv = bid_piv.resample(rule, closed="left", label="right").last().ffill()
-            ask_piv = ask_piv.resample(rule, closed="left", label="right").last().ffill()
+            t_ns = uniq_ts.astype(np.int64)
+            t_min = t_ns.min()
+            rule_ns = int(self.grid_resolution_ms) * 1_000_000
+            bin_id = (t_ns - t_min) // rule_ns
+            order = np.argsort(bin_id)
+            bin_sorted = bin_id[order]
+            unique_bins, start_idx = np.unique(bin_sorted, return_index=True)
+            end_idx = np.concatenate([start_idx[1:], [n_ts]])
+            last_row_idx = order[end_idx - 1]
+            binned = wide[last_row_idx]
+            binned_ffill = pd.DataFrame(binned).ffill().values
+            right_edge_ns = t_min + (unique_bins + 1) * rule_ns
+            index = pd.to_datetime(right_edge_ns, unit="ns")
+            index.name = "exchange_ts"
+            wide = binned_ffill
 
-        # Убираем мультииндекс у колонок
-        bid_piv.columns = [f"bid_{col[0]}_{col[1]}" for col in bid_piv.columns]
-        ask_piv.columns = [f"ask_{col[0]}_{col[1]}" for col in ask_piv.columns]
-
-        wide_df = pd.concat([bid_piv, ask_piv], axis=1)
-
+        wide_df = pd.DataFrame(wide, index=index, columns=bid_cols + ask_cols)
         return wide_df

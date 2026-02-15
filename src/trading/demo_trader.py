@@ -5,6 +5,8 @@ from tqdm import tqdm
 from pathlib import Path
 from xgboost import XGBRegressor
 from torch.utils.tensorboard import SummaryWriter
+from typing import Optional
+
 from src.trading.backtest_trader import BaseTrader
 from src.parser.live_collector import LiveCollector
 from src.mlcore.dataloader import get_processed_data, calculate_features
@@ -86,7 +88,7 @@ class DemoTrader(BaseTrader):
 
             await asyncio.sleep(0.05)
 
-    def cancel_old_orders(self):
+    async def cancel_old_orders(self) -> None:
         if self.buy_order:
             print(f"❌ Cancelled old BUY order at: {self.buy_order['price']}")
             self.buy_order = None
@@ -94,7 +96,7 @@ class DemoTrader(BaseTrader):
             print(f"❌ Cancelled old SELL order at: {self.sell_order['price']}")
             self.sell_order = None
 
-    def place_new_orders(self, last_price: float, mid_pred: float, spread_pred: float) -> None:
+    async def place_new_orders(self, last_price: float, mid_pred: float, spread_pred: float) -> None:
         buy_price, sell_price = self.calculate_optimal_quotes(
             last_price=last_price,
             mid_pred=mid_pred,
@@ -118,13 +120,21 @@ class DemoTrader(BaseTrader):
             }
             print(f"📉 Placed SELL order at: {sell_price}")
 
-    async def run(self, symbol: str = "BTCUSDC") -> None:
-        # Запускаем парсер данных в реальном времени
-        self.parser = LiveCollector(symbol=symbol, retention_seconds=300)
+    async def run(
+        self,
+        symbol: str = "BTCUSDC",
+        grid_resolution_ms: Optional[int] = None,
+        quote_interval_sec: float = 0.05,
+    ) -> None:
+        """
+        grid_resolution_ms: интервал сетки в мс (5000 по умолчанию; 100 для высокой частоты).
+        quote_interval_sec: пауза в цикле (0.05 = 50 ms).
+        """
+        resolution = grid_resolution_ms if grid_resolution_ms is not None else 5000
+        self.parser = LiveCollector(symbol=symbol.upper(), retention_seconds=300)
         parser_task = asyncio.create_task(self.parser.start())
 
         try:
-            # Ждём пока соберётся достаточное количество данных
             print("⏳ Warming up data collector for 300 seconds...")
             pbar = tqdm(total=300, desc="Collecting data...", unit="s")
             for _ in range(300):
@@ -133,44 +143,42 @@ class DemoTrader(BaseTrader):
             pbar.close()
 
             self.background_task = asyncio.create_task(self.background_monitoring())
+            print("🟢 Demo trading started!")
+            df = get_processed_data(
+                source="live",
+                live_collector=self.parser,
+                grid_resolution_ms=resolution,
+            )
+            last_bar_time = df.iloc[-1]["exchange_ts"] if not df.empty else None
 
-            print("🟢 Trading started!")
-            df = get_processed_data(source='live', live_collector=self.parser)
-            last_bar_time = df.iloc[-1]['exchange_ts']
             while True:
                 try:
-                    # Получаем данные всегда 
-                    df = get_processed_data(source='live', live_collector=self.parser)
-                    current_bar_time = df.iloc[-1]['exchange_ts']
-
-                    # Как только получили новую временную метку
-                    if current_bar_time > last_bar_time:
-                        # Получаем предпоследнюю цену
-                        last_price = df.iloc[-2]['close']
-                        # Генерируем признаки
+                    df = get_processed_data(
+                        source="live",
+                        live_collector=self.parser,
+                        grid_resolution_ms=resolution,
+                    )
+                    if df.empty or len(df) < 2:
+                        await asyncio.sleep(quote_interval_sec)
+                        continue
+                    current_bar_time = df.iloc[-1]["exchange_ts"]
+                    if last_bar_time is not None and current_bar_time > last_bar_time:
+                        last_price = float(df.iloc[-2]["close"])
                         features = calculate_features(df, filename="all_features")
-                        # Получаем признаки за ПРЕДПОСЛЕДНЮЮ метку
                         model_input = features.iloc[-2:-1].copy()
-                        # Делаем прогноз моделeй
-                        mid_pred = self.mid_model.predict(model_input)[0]
-                        spread_pred = self.spread_model.predict(model_input)[0]
-                        
-                        # Отменяем старые ордеры
-                        self.cancel_old_orders()
-
-                        # Выставляем новые ордеры
-                        self.place_new_orders(last_price, mid_pred, spread_pred)
-
-                        # Запоминаем текущую временную метку
-                        last_bar_time = df.iloc[-1]['exchange_ts']
-                        
+                        if model_input.isna().any().any():
+                            model_input = model_input.fillna(0)
+                        mid_pred = float(self.mid_model.predict(model_input)[0])
+                        spread_pred = float(self.spread_model.predict(model_input)[0])
+                        await self.cancel_old_orders()
+                        await self.place_new_orders(last_price, mid_pred, spread_pred)
+                        last_bar_time = current_bar_time
                 except Exception as e:
                     print(f"⚠️ Trading loop error: {e}")
-
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(quote_interval_sec)
 
         finally:
-            print("🛑 Shutting down DemoTraider...")
+            print("🛑 Shutting down DemoTrader...")
             if self.background_task and not self.background_task.done():
                 self.background_task.cancel()
                 try:
