@@ -277,6 +277,7 @@ class LiveTrader(BaseTrader):
                     # Отменяем и выставляем новые ордера только при появлении нового бара
                     if last_bar_time is not None and current_bar_time > last_bar_time:
                         cancel_task = asyncio.create_task(self.cancel_old_orders())
+                        # Текущий бар (iloc[-1]) ещё не закрыт — используем только закрытый бар iloc[-2] для фичей и close
                         last_price = float(df.iloc[-2]["close"])
                         features = calculate_features(df, filename="all_features")
                         model_input = features.iloc[-2:-1].copy()

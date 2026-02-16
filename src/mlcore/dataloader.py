@@ -6,6 +6,7 @@
 """
 import json
 import os
+import time
 import glob
 import inspect
 import importlib.util
@@ -68,13 +69,26 @@ def _save_processed_meta(save_dir: str, meta: dict) -> None:
         json.dump(meta, f, indent=2, ensure_ascii=False)
 
 
-def _reindex_to_regular_grid(df: pd.DataFrame, rule_ns: int) -> pd.DataFrame:
-    """Приводит кадр к регулярной временной сетке с шагом rule_ns (одна строка на интервал)."""
+def _reindex_to_regular_grid(
+    df: pd.DataFrame, rule_ns: int, extend_to_now_ns: Optional[int] = None
+) -> pd.DataFrame:
+    """
+    Приводит кадр к регулярной временной сетке с шагом rule_ns (одна строка на интервал).
+    По данным: если ts_max на границе сетки — не добавлять лишний бар (:05, а не :10).
+    extend_to_now_ns: для live — правая граница текущего бара по «сейчас», чтобы последняя строка не отставала (всегда >= текущий бар).
+    """
     ts = pd.to_datetime(df["exchange_ts"])
     ts_min_ns = ts.min().value
     ts_max_ns = ts.max().value
     first_ns = (ts_min_ns // rule_ns) * rule_ns
-    regular_ns = np.arange(first_ns, ts_max_ns + 1, rule_ns, dtype=np.int64)
+    if ts_max_ns % rule_ns == 0:
+        end_ns = ts_max_ns
+    else:
+        end_ns = ((ts_max_ns // rule_ns) + 1) * rule_ns
+    if extend_to_now_ns is not None:
+        now_bar_end_ns = ((extend_to_now_ns // rule_ns) + 1) * rule_ns
+        end_ns = max(end_ns, now_bar_end_ns)
+    regular_ns = np.arange(first_ns, end_ns + 1, rule_ns, dtype=np.int64)
     regular_index = pd.to_datetime(regular_ns, unit="ns")
     df = df.set_index("exchange_ts")
     df = df.reindex(regular_index).ffill()
@@ -202,7 +216,7 @@ def process_raw_stream(
 def get_processed_data(
     source: str = "local",
     symbol: str = "BTCUSDT",
-    drop_last: bool = True,
+    drop_last: bool = False,
     save_dir: str = "parquets/",
     data_dir: str = "data",
     live_collector: Optional[LiveCollector] = None,
@@ -213,6 +227,7 @@ def get_processed_data(
 
     source: "local" — merged.parquet из save_dir; "raw" — parquet из data_dir/data_{symbol}/; "live" — из live_collector.
     grid_resolution_ms: интервал сетки в мс (5000 = 5 s, 10000 = 10 s, 100 = 100 ms). None — тиковый режим. По умолчанию 5000.
+    drop_last: при source="raw" — если False (по умолчанию), последний файл включается, и последняя строка доходит до 0.0000 следующего часа (XX:00:00.000); если True — последний файл отбрасывается, данные заканчиваются на XX:59:55.
     Потоки объединяются через outer merge по exchange_ts — строки не теряются (все метки времени сохраняются).
     """
     if grid_resolution_ms is not _RESOLUTION_UNSET:
@@ -401,7 +416,9 @@ def get_processed_data(
         out = out.sort_values("exchange_ts").ffill()
         rule_ns = _rule_ns_from_resolution(resolution_kw)
         if rule_ns is not None and not out.empty:
-            out = _reindex_to_regular_grid(out, rule_ns)
+            out = _reindex_to_regular_grid(
+                out, rule_ns, extend_to_now_ns=int(time.time_ns())
+            )
         return out
 
     else:

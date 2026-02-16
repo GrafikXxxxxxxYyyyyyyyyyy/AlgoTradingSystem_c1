@@ -163,6 +163,7 @@ class DemoTrader(BaseTrader):
                         continue
                     current_bar_time = df.iloc[-1]["exchange_ts"]
                     if last_bar_time is not None and current_bar_time > last_bar_time:
+                        # Текущий бар (iloc[-1]) ещё не закрыт — используем только закрытый бар iloc[-2]
                         last_price = float(df.iloc[-2]["close"])
                         features = calculate_features(df, filename="all_features")
                         model_input = features.iloc[-2:-1].copy()
