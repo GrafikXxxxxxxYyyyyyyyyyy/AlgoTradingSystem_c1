@@ -7,7 +7,7 @@ from tqdm import tqdm
 from pathlib import Path
 from xgboost import XGBRegressor
 from binance import AsyncClient
-from torch.utils.tensorboard import SummaryWriter
+from tensorboardX import SummaryWriter
 from src.trading.backtest_trader import BaseTrader
 from src.parser.live_collector import LiveCollector
 from src.mlcore.dataloader import get_processed_data, calculate_features
