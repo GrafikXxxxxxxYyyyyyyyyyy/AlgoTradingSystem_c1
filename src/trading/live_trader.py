@@ -61,21 +61,24 @@ class LiveTrader(BaseTrader):
 
 
     async def sync_position_from_exchange(self) -> None:
-        """Синхронизирует position и avg_entry_price с биржей (полезно при старте после перезапуска)."""
+        """Синхронизирует position и avg_entry_price с биржей. Запрос без lock, запись — под lock."""
         try:
             acc = await self.client.futures_account()
+            amt, entry = 0.0, 0.0
             for pos in acc.get("positions", []):
                 if pos.get("symbol") != self.symbol.upper():
                     continue
                 amt = float(pos.get("positionAmt", 0) or 0)
                 entry = float(pos.get("entryPrice", 0) or 0)
-                if amt != 0:
-                    self.position = amt
-                    self.avg_entry_price = entry
-                    print(f"📌 Позиция с биржи: {self.position}, avg entry: {self.avg_entry_price}")
                 break
+            async with self.state_lock:
+                self.position = amt
+                self.avg_entry_price = entry
+                if amt != 0:
+                    print(f"📌 Позиция с биржи: {self.position}, avg entry: {self.avg_entry_price}")
         except Exception as e:
             print(f"⚠️ Не удалось синхронизировать позицию с биржей: {e}")
+
 
     async def _get_order_fill_info(self, order_id: int) -> Tuple[float, float]:
         """Запрашивает у биржи фактически исполненный объём и среднюю цену исполнения. Возвращает (executed_qty, avg_price)."""
@@ -89,6 +92,7 @@ class LiveTrader(BaseTrader):
         except Exception as e:
             print(f"⚠️ Не удалось получить детали ордера {order_id}: {e}")
             return 0.0, 0.0
+
 
     async def background_monitoring(self) -> None:
         print("✅ Warmup finished. Now starting background monitoring...")
@@ -136,9 +140,9 @@ class LiveTrader(BaseTrader):
 
             await asyncio.sleep(0.05)
 
-        
+
     async def cancel_old_orders(self) -> None:
-        """Отмена всех ордеров по символу одним запросом (один round-trip). Новые не выставляются до завершения отмены."""
+        """Отмена всех ордеров по символу одним запросом. Позиция подтягивается с биржи после отмены (в run), без лишних вызовов здесь."""
         async with self.state_lock:
             has_orders = self.buy_order is not None or self.sell_order is not None
             buy_id = self.buy_order["orderId"] if self.buy_order else None
@@ -276,8 +280,10 @@ class LiveTrader(BaseTrader):
                     current_bar_time = df.iloc[-1]["exchange_ts"]
                     # Отменяем и выставляем новые ордера только при появлении нового бара
                     if last_bar_time is not None and current_bar_time > last_bar_time:
+                        # Отмена и синхронизация позиции — параллельно, без добавления задержки к горячему пути
                         cancel_task = asyncio.create_task(self.cancel_old_orders())
-                        # Текущий бар (iloc[-1]) ещё не закрыт — используем только закрытый бар iloc[-2] для фичей и close
+                        sync_task = asyncio.create_task(self.sync_position_from_exchange())
+                        # Считаем фичи и предикты пока cancel + sync в полёте
                         last_price = float(df.iloc[-2]["close"])
                         features = calculate_features(df, filename="all_features")
                         model_input = features.iloc[-2:-1].copy()
@@ -286,9 +292,9 @@ class LiveTrader(BaseTrader):
                         mid_pred = float(self.mid_model.predict(model_input)[0])
                         spread_pred = float(self.spread_model.predict(model_input)[0])
                         await cancel_task
+                        await sync_task
                         await self.place_new_orders(last_price, mid_pred, spread_pred)
                         last_bar_time = current_bar_time
-                    await asyncio.sleep(quote_interval_sec)
                 except Exception as e:
                     print(f"⚠️ Trading loop error: {e}")
                 await asyncio.sleep(quote_interval_sec)
@@ -296,6 +302,12 @@ class LiveTrader(BaseTrader):
         finally:
             print("🛑 Завершение...")
             self.shutdown = True
+
+            # Актуальная позиция с биржи перед закрытием
+            try:
+                await self.sync_position_from_exchange()
+            except Exception:
+                pass
 
             # Отменяем все ордера
             try:
