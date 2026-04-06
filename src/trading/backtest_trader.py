@@ -469,25 +469,12 @@ def optimize_parameters_fast(
         verbose=True
     )
     
-    best_params = {
+    return {
         'alpha': result.x[0],
         'beta': result.x[1],
         'gamma': result.x[2],
-        'epsilon': result.x[3]
-    }
-    
-    # Финальный бэктест с лучшими параметрами
-    final_backtester = BacktestTrader(**best_params, max_position=max_position, position_qty=position_qty)
-    best_results = final_backtester.run(
-        ohlcv=ohlcv,
-        mid_predicts=mid_predicts,
-        spread_predicts=spread_predicts,
-        position_size=position_size,
-    )
-    
-    return {
-        'best_params': best_params,
+        'epsilon': result.x[3],
+        'max_position': max_position,
+        'position_qty': position_qty,
         'best_sharpe': -result.fun,  # Возвращаем положительный Sharpe
-        'best_results': best_results,
-        'optimization_history': result  # Для анализа сходимости
     }
