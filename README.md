@@ -1,1 +1,0 @@
-# AlgoTradingSystem_c1
