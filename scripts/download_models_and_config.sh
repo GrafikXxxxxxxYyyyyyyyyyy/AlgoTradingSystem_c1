@@ -7,7 +7,7 @@ MODELS_DIR="$PROJECT_ROOT/models"
 
 # Конфигурация
 REMOTE_USER="root"
-REMOTE_HOST="87.228.88.220"
+REMOTE_HOST="87.228.88.219"
 
 REMOTE_MODEL_MID="/root/AlgoTradingSystem_c1/models/model_mid.json"
 REMOTE_MODEL_SPREAD="/root/AlgoTradingSystem_c1/models/model_spread.json"
