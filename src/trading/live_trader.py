@@ -74,10 +74,29 @@ class LiveTrader(BaseTrader):
             async with self.state_lock:
                 self.position = amt
                 self.avg_entry_price = entry
+                if amt > 0:
+                    self._last_long_entry = entry
+                elif amt < 0:
+                    self._last_short_entry = entry
                 if amt != 0:
                     print(f"📌 Позиция с биржи: {self.position}, avg entry: {self.avg_entry_price}")
         except Exception as e:
             print(f"⚠️ Не удалось синхронизировать позицию с биржей: {e}")
+
+
+    async def _fetch_exchange_position_snapshot(self) -> Optional[Tuple[float, float]]:
+        """Текущее net-позиция и entryPrice с биржи (post-fill). One-way mode."""
+        try:
+            rows = await self.client.futures_position_information(symbol=self.symbol.upper())
+            if not rows:
+                return (0.0, 0.0)
+            row = rows[0]
+            amt = float(row.get("positionAmt", 0) or 0)
+            entry = float(row.get("entryPrice", 0) or 0)
+            return (amt, entry)
+        except Exception as e:
+            print(f"⚠️ Не удалось получить позицию для сверки PnL: {e}")
+            return None
 
 
     async def _get_order_fill_info(self, order_id: int) -> Tuple[float, float]:
@@ -110,11 +129,21 @@ class LiveTrader(BaseTrader):
                         order_id = self.buy_order["orderId"]
                         executed_qty, avg_price = await self._get_order_fill_info(order_id)
                         if executed_qty > 0:
-                            self.handle_buy_order(
-                                fill_price=avg_price if avg_price > 0 else float(self.buy_order["price"]),
-                                commission=0.0,
-                                actual_filled_qty=executed_qty,
-                            )
+                            fp = avg_price if avg_price > 0 else float(self.buy_order["price"])
+                            exc_post = await self._fetch_exchange_position_snapshot()
+                            if exc_post is not None:
+                                self.handle_buy_order(
+                                    fill_price=fp,
+                                    commission=0.0,
+                                    actual_filled_qty=executed_qty,
+                                    exchange_post=exc_post,
+                                )
+                            else:
+                                self.handle_buy_order(
+                                    fill_price=fp,
+                                    commission=0.0,
+                                    actual_filled_qty=executed_qty,
+                                )
                             print(f"✅ Buy filled: qty={executed_qty}, avg={avg_price}. Position: {self.position}, Realized PnL: {self.realized_pnl}")
                         else:
                             self.buy_order = None
@@ -123,11 +152,21 @@ class LiveTrader(BaseTrader):
                         order_id = self.sell_order["orderId"]
                         executed_qty, avg_price = await self._get_order_fill_info(order_id)
                         if executed_qty > 0:
-                            self.handle_sell_order(
-                                fill_price=avg_price if avg_price > 0 else float(self.sell_order["price"]),
-                                commission=0.0,
-                                actual_filled_qty=executed_qty,
-                            )
+                            fp = avg_price if avg_price > 0 else float(self.sell_order["price"])
+                            exc_post = await self._fetch_exchange_position_snapshot()
+                            if exc_post is not None:
+                                self.handle_sell_order(
+                                    fill_price=fp,
+                                    commission=0.0,
+                                    actual_filled_qty=executed_qty,
+                                    exchange_post=exc_post,
+                                )
+                            else:
+                                self.handle_sell_order(
+                                    fill_price=fp,
+                                    commission=0.0,
+                                    actual_filled_qty=executed_qty,
+                                )
                             print(f"✅ Sell filled: qty={executed_qty}, avg={avg_price}. Position: {self.position}, Realized PnL: {self.realized_pnl}")
                         else:
                             self.sell_order = None

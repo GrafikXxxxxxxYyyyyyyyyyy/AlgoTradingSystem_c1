@@ -36,6 +36,10 @@ class BaseTrader(ABC):
         self.avg_entry_price = 0.0
         self.realized_pnl = 0.0
 
+        # Последние цены входа по стороне (для realized PnL при сверке с пост-состоянием биржи после флипа)
+        self._last_long_entry: float = 0.0
+        self._last_short_entry: float = 0.0
+
         # Текущие ордера
         self.buy_order: Optional[Dict[str, Any]] = None
         self.sell_order: Optional[Dict[str, Any]] = None
@@ -86,6 +90,7 @@ class BaseTrader(ABC):
         fill_price: Optional[float] = None,
         commission: float = 0.0,
         actual_filled_qty: Optional[float] = None,
+        exchange_post: Optional[Tuple[float, float]] = None,
     ) -> None:
         """actual_filled_qty: фактически исполненный объём (при частичном исполнении). Если None — берётся origQty."""
         qty = float(actual_filled_qty if actual_filled_qty is not None else self.buy_order['origQty'])
@@ -95,6 +100,30 @@ class BaseTrader(ABC):
         order_price = float(self.buy_order['price'])
         if fill_price is None:
             fill_price = order_price
+
+        # Актуальное (post-fill) состояние с биржи: иначе локальное «до сделки» могло быть затёрто sync.
+        if exchange_post is not None:
+            post_P, post_E = exchange_post
+            p = float(fill_price)
+            q = qty
+            pre_P = post_P - q
+            delta = 0.0
+            if pre_P < 0:
+                closed_short = min(abs(pre_P), q)
+                if post_P < 0:
+                    entry_ref = post_E
+                else:
+                    entry_ref = self._last_short_entry
+                delta = closed_short * (entry_ref - p)
+            self.realized_pnl += delta - commission
+            self.position = post_P
+            self.avg_entry_price = post_E
+            if post_P > 0:
+                self._last_long_entry = post_E
+            elif post_P < 0:
+                self._last_short_entry = post_E
+            self.buy_order = None
+            return
 
         if self.position >= 0:
             new_position = self.position + qty
@@ -122,6 +151,7 @@ class BaseTrader(ABC):
         fill_price: Optional[float] = None,
         commission: float = 0.0,
         actual_filled_qty: Optional[float] = None,
+        exchange_post: Optional[Tuple[float, float]] = None,
     ) -> None:
         """actual_filled_qty: фактически исполненный объём (при частичном исполнении). Если None — берётся origQty."""
         qty = float(actual_filled_qty if actual_filled_qty is not None else self.sell_order['origQty'])
@@ -131,6 +161,29 @@ class BaseTrader(ABC):
         order_price = float(self.sell_order['price'])
         if fill_price is None:
             fill_price = order_price
+
+        if exchange_post is not None:
+            post_P, post_E = exchange_post
+            p = float(fill_price)
+            q = qty
+            pre_P = post_P + q
+            delta = 0.0
+            if pre_P > 0:
+                closed_long = min(pre_P, q)
+                if post_P > 0:
+                    entry_ref = post_E
+                else:
+                    entry_ref = self._last_long_entry
+                delta = closed_long * (p - entry_ref)
+            self.realized_pnl += delta - commission
+            self.position = post_P
+            self.avg_entry_price = post_E
+            if post_P > 0:
+                self._last_long_entry = post_E
+            elif post_P < 0:
+                self._last_short_entry = post_E
+            self.sell_order = None
+            return
 
         if self.position <= 0:
             new_position = self.position - qty
