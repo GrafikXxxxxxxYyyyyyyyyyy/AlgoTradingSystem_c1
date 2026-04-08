@@ -1,7 +1,7 @@
 import asyncio
 import numpy as np
 import pandas as pd
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from tqdm import tqdm
 from pathlib import Path
@@ -58,7 +58,76 @@ class LiveTrader(BaseTrader):
 
         self.shutdown = False
         self.state_lock = asyncio.Lock()
+        # Исполнения, уже учтённые в realized_pnl (защита от двойного учёта: фон + cancel_old_orders).
+        self._accounted_fill_order_ids: set[int] = set()
 
+    async def _apply_filled_order(self, snap: Dict[str, Any], side: str) -> None:
+        """
+        Запрашивает факт исполнения по orderId из snap и при ненулевом объёме вызывает handle_*.
+        Используется и фоном, и отменой ордеров на новом баре (до обнуления ссылок snap сохраняется отдельно).
+        """
+        oid = int(snap["orderId"])
+        async with self.state_lock:
+            if oid in self._accounted_fill_order_ids:
+                return
+        executed_qty, avg_price = await self._get_order_fill_info(oid)
+        if executed_qty <= 0:
+            async with self.state_lock:
+                if side == "buy" and self.buy_order and int(self.buy_order["orderId"]) == oid:
+                    self.buy_order = None
+                elif side == "sell" and self.sell_order and int(self.sell_order["orderId"]) == oid:
+                    self.sell_order = None
+            return
+
+        fp = avg_price if avg_price > 0 else float(snap.get("price", 0) or 0)
+        exc_post = await self._fetch_exchange_position_snapshot()
+
+        async with self.state_lock:
+            if oid in self._accounted_fill_order_ids:
+                return
+            if side == "buy":
+                self.buy_order = snap
+                try:
+                    if exc_post is not None:
+                        self.handle_buy_order(
+                            fill_price=fp,
+                            commission=0.0,
+                            actual_filled_qty=executed_qty,
+                            exchange_post=exc_post,
+                        )
+                    else:
+                        self.handle_buy_order(
+                            fill_price=fp,
+                            commission=0.0,
+                            actual_filled_qty=executed_qty,
+                        )
+                finally:
+                    self.buy_order = None
+            else:
+                self.sell_order = snap
+                try:
+                    if exc_post is not None:
+                        self.handle_sell_order(
+                            fill_price=fp,
+                            commission=0.0,
+                            actual_filled_qty=executed_qty,
+                            exchange_post=exc_post,
+                        )
+                    else:
+                        self.handle_sell_order(
+                            fill_price=fp,
+                            commission=0.0,
+                            actual_filled_qty=executed_qty,
+                        )
+                finally:
+                    self.sell_order = None
+            self._accounted_fill_order_ids.add(oid)
+
+        label = "покупку" if side == "buy" else "продажу"
+        print(
+            f"✅ Исполнение {label}: qty={executed_qty}, avg={avg_price}. "
+            f"Position: {self.position}, Realized PnL: {self.realized_pnl}"
+        )
 
     async def sync_position_from_exchange(self) -> None:
         """Синхронизирует position и avg_entry_price с биржей. Запрос без lock, запись — под lock."""
@@ -117,79 +186,51 @@ class LiveTrader(BaseTrader):
         print("✅ Warmup finished. Now starting background monitoring...")
 
         while not self.shutdown:
-            async with self.state_lock:
-                try:
-                    orders = await self.client.futures_get_open_orders(symbol=self.symbol.upper())
-                    order_ids = {str(o["orderId"]) for o in orders}
+            try:
+                async with self.state_lock:
+                    buy_snap = dict(self.buy_order) if self.buy_order else None
+                    sell_snap = dict(self.sell_order) if self.sell_order else None
 
-                    buy_done = self.buy_order and str(self.buy_order["orderId"]) not in order_ids
-                    sell_done = self.sell_order and str(self.sell_order["orderId"]) not in order_ids
+                orders = await self.client.futures_get_open_orders(symbol=self.symbol.upper())
+                order_ids = {str(o["orderId"]) for o in orders}
 
-                    if buy_done:
-                        order_id = self.buy_order["orderId"]
-                        executed_qty, avg_price = await self._get_order_fill_info(order_id)
-                        if executed_qty > 0:
-                            fp = avg_price if avg_price > 0 else float(self.buy_order["price"])
-                            exc_post = await self._fetch_exchange_position_snapshot()
-                            if exc_post is not None:
-                                self.handle_buy_order(
-                                    fill_price=fp,
-                                    commission=0.0,
-                                    actual_filled_qty=executed_qty,
-                                    exchange_post=exc_post,
-                                )
-                            else:
-                                self.handle_buy_order(
-                                    fill_price=fp,
-                                    commission=0.0,
-                                    actual_filled_qty=executed_qty,
-                                )
-                            print(f"✅ Buy filled: qty={executed_qty}, avg={avg_price}. Position: {self.position}, Realized PnL: {self.realized_pnl}")
-                        else:
-                            self.buy_order = None
+                buy_done = buy_snap and str(buy_snap["orderId"]) not in order_ids
+                sell_done = sell_snap and str(sell_snap["orderId"]) not in order_ids
 
-                    if sell_done:
-                        order_id = self.sell_order["orderId"]
-                        executed_qty, avg_price = await self._get_order_fill_info(order_id)
-                        if executed_qty > 0:
-                            fp = avg_price if avg_price > 0 else float(self.sell_order["price"])
-                            exc_post = await self._fetch_exchange_position_snapshot()
-                            if exc_post is not None:
-                                self.handle_sell_order(
-                                    fill_price=fp,
-                                    commission=0.0,
-                                    actual_filled_qty=executed_qty,
-                                    exchange_post=exc_post,
-                                )
-                            else:
-                                self.handle_sell_order(
-                                    fill_price=fp,
-                                    commission=0.0,
-                                    actual_filled_qty=executed_qty,
-                                )
-                            print(f"✅ Sell filled: qty={executed_qty}, avg={avg_price}. Position: {self.position}, Realized PnL: {self.realized_pnl}")
-                        else:
-                            self.sell_order = None
+                if buy_done:
+                    await self._apply_filled_order(buy_snap, "buy")
+                if sell_done:
+                    await self._apply_filled_order(sell_snap, "sell")
 
+                async with self.state_lock:
                     self.writer.add_scalar("Realized_PnL", self.realized_pnl, self.step)
                     self.writer.add_scalar("Position", self.position, self.step)
                     self.step += 1
-                except Exception as e:
-                    print(f"⚠️ Background monitoring error: {e}")
+            except Exception as e:
+                print(f"⚠️ Background monitoring error: {e}")
 
             await asyncio.sleep(0.05)
 
 
     async def cancel_old_orders(self) -> None:
-        """Отмена всех ордеров по символу одним запросом. Позиция подтягивается с биржи после отмены (в run), без лишних вызовов здесь."""
+        """
+        Сначала учитываем исполнения по сохранённым snap (иначе гонка с фоном теряла филлы и PnL),
+        затем отменяем оставшиеся заявки на символе.
+        """
         async with self.state_lock:
             has_orders = self.buy_order is not None or self.sell_order is not None
-            buy_id = self.buy_order["orderId"] if self.buy_order else None
-            sell_id = self.sell_order["orderId"] if self.sell_order else None
+            buy_snap = dict(self.buy_order) if self.buy_order else None
+            sell_snap = dict(self.sell_order) if self.sell_order else None
+            buy_id = buy_snap["orderId"] if buy_snap else None
+            sell_id = sell_snap["orderId"] if sell_snap else None
             self.buy_order = None
             self.sell_order = None
         if not has_orders:
             return
+        if buy_snap:
+            await self._apply_filled_order(buy_snap, "buy")
+        if sell_snap:
+            await self._apply_filled_order(sell_snap, "sell")
         sym = self.symbol.upper()
         try:
             await self.client.futures_cancel_all_open_orders(symbol=sym)
