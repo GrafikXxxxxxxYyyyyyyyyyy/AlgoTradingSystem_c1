@@ -11,6 +11,7 @@ from websockets import connect, ConnectionClosed
 
 from .orderbook import OrderBook
 from .buffer import InMemoryBuffer
+from .config import futures_ws_market, futures_ws_public, unwrap_binance_ws_payload
 
 logger = logging.getLogger("LiveCollector")
 
@@ -18,9 +19,11 @@ logger = logging.getLogger("LiveCollector")
 class LiveCollector:
     def __init__(
         self,
-        symbol: str = "BTCUSDC",
+        symbol: str = "BTCUSDT",
         retention_seconds: int = 30,
-        orderbook_levels: int = 100,
+        orderbook_levels: int = 1000,
+        orderbook_snapshot_interval_sec: float = 0.2,  # больше не используется
+        open_interest_fetch_interval_sec: float = 1.0,
     ):
         self.symbol = symbol.upper()
         self.retention_ms = retention_seconds * 1000
@@ -95,7 +98,7 @@ class LiveCollector:
                 snapshot = await self.fetch_depth_snapshot()
                 if snapshot:
                     self.book.apply_snapshot(snapshot)
-                    stream_url = f"wss://fstream.binance.com/ws/{self.symbol.lower()}@depth@100ms"
+                    stream_url = futures_ws_public(self.symbol, "depth@100ms")
                     asyncio.create_task(self.websocket_reader(stream_url, self._depth_handler))
                     logger.info(f"📸 Snapshot refetched (lastUpdateId={self.book.last_update_id})")
                     return
@@ -113,7 +116,7 @@ class LiveCollector:
         self.book.apply_snapshot(snapshot)
         logger.info(f"📸 Snapshot received (lastUpdateId={self.book.last_update_id})")
 
-        stream_url = f"wss://fstream.binance.com/ws/{self.symbol.lower()}@depth@100ms"
+        stream_url = futures_ws_public(self.symbol, "depth@100ms")
         asyncio.create_task(self.websocket_reader(stream_url, self._depth_handler))
 
         for _ in range(20):
@@ -174,6 +177,8 @@ class LiveCollector:
         self._process_depth_diff(msg)
 
     def process_agg_trade(self, msg: Dict[str, Any]):
+        if msg.get("e") != "aggTrade":
+            return
         self._buffer("aggTrades", {
             "tradeId": msg["a"],
             "price": float(msg["p"]),
@@ -183,6 +188,8 @@ class LiveCollector:
         })
 
     def process_raw_trade(self, msg: Dict[str, Any]):
+        if msg.get("e") != "trade":
+            return
         self._buffer("rawTrades", {
             "id": msg["t"],
             "price": float(msg["p"]),
@@ -213,18 +220,15 @@ class LiveCollector:
         reconnect_delay_base = 1.0
         while self.running and attempt < max_reconnect_attempts:
             try:
-                async with connect(
-                    stream_url,
-                    ping_interval=20,
-                    ping_timeout=60,
-                    close_timeout=5
-                ) as ws:
+                async with connect(stream_url) as ws:
                     logger.info(f"🔌 Connected to {stream_url}")
                     attempt = 0
                     while self.running:
                         try:
                             msg = await asyncio.wait_for(ws.recv(), timeout=30.0)
-                            data = json.loads(msg)
+                            data = unwrap_binance_ws_payload(json.loads(msg))
+                            if data is None:
+                                continue
                             if asyncio.iscoroutinefunction(handler):
                                 await handler(data)
                             else:
@@ -257,10 +261,10 @@ class LiveCollector:
         await self._proper_orderbook_init()
 
         streams = [
-            (f"wss://fstream.binance.com/ws/{self.symbol.lower()}@aggTrade", self.process_agg_trade),
-            (f"wss://fstream.binance.com/ws/{self.symbol.lower()}@trade", self.process_raw_trade),
-            (f"wss://fstream.binance.com/ws/{self.symbol.lower()}@markPrice@1s", self.process_mark_price),
-            (f"wss://fstream.binance.com/ws/{self.symbol.lower()}@bookTicker", self.process_book_ticker),
+            (futures_ws_market(self.symbol, "aggTrade"), self.process_agg_trade),
+            (futures_ws_public(self.symbol, "trade"), self.process_raw_trade),
+            (futures_ws_market(self.symbol, "markPrice@1s"), self.process_mark_price),
+            (futures_ws_public(self.symbol, "bookTicker"), self.process_book_ticker),
         ]
 
         tasks = []
