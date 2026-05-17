@@ -2,11 +2,11 @@ import numpy as np
 import pandas as pd
 
 from tqdm import tqdm
-from functools import partial
 from itertools import product
 from abc import ABC, abstractmethod
-from typing import Dict, Tuple, Optional, Any
-from src.mlcore.dataloader import calculate_features
+from typing import Dict, Tuple, Optional, Any, List
+from src.trading.mm_backtest_numba import numba_available, simulate_mm_backtest
+from src.trading.nsga2_pareto import run_nsga2
 
 
 
@@ -330,33 +330,126 @@ class BacktestTrader(BaseTrader):
         spread_predicts: np.ndarray,
         position_size: float = 100.0,
         bar_seconds: float = 5.0,
+        stride: int = 1,
+        use_numba: Optional[bool] = None,
+        store_curves: bool = True,
     ) -> Dict[str, Any]:
         """
         bar_seconds : длительность одного бара в секундах (для годовой нормализации Sharpe).
-                      5.0 для 5s, 1.0 для 1s, 0.1 для 100ms.
+        stride : использовать каждый stride-й бар (увеличивает скорость, меняет метрики; для оптимизации обычно 1 или >1 без store_curves).
+        use_numba : None — использовать Numba, если установлен и доступен симулятор.
+        store_curves : при False не строятся кривые (ускорение и экономия памяти).
         """
         assert len(ohlcv) == len(mid_predicts)
         assert len(ohlcv) == len(spread_predicts)
-        n = len(ohlcv)
+        n_all = len(ohlcv)
+        assert stride >= 1
 
-        # Buy & Hold baseline
-        initial_price = ohlcv['close'].iloc[0]
-        bh_pnl = (ohlcv['close'] / initial_price - 1) * position_size
+        close_np = np.ascontiguousarray(ohlcv["close"].to_numpy(dtype=np.float64, copy=False))
+        initial_price = float(close_np[0])
+        bh_pnl = (close_np / initial_price - 1.0) * position_size
         bh_curve = bh_pnl.tolist()
 
-        for i in range(n):
-            low = ohlcv['low'].iloc[i]
-            high = ohlcv['high'].iloc[i]
-            close = ohlcv['close'].iloc[i]
+        if use_numba is None:
+            use_numba = numba_available()
 
-            # 1. Проверяем исполнение ордеров (с комиссией и проскальзыванием)
+        low_np = np.ascontiguousarray(ohlcv["low"].to_numpy(dtype=np.float64, copy=False))
+        high_np = np.ascontiguousarray(ohlcv["high"].to_numpy(dtype=np.float64, copy=False))
+        mid_np = np.ascontiguousarray(np.asarray(mid_predicts, dtype=np.float64))
+        spread_np = np.ascontiguousarray(np.asarray(spread_predicts, dtype=np.float64))
+
+        n_eff = (n_all + stride - 1) // stride
+        curves_empty: List[float] = []
+
+        if use_numba and numba_available():
+            if store_curves:
+                pc = np.empty(n_eff, dtype=np.float64)
+                rc = np.empty(n_eff, dtype=np.float64)
+                uc = np.empty(n_eff, dtype=np.float64)
+                tp = np.empty(n_eff, dtype=np.float64)
+            else:
+                pc = rc = uc = tp = np.empty(0, dtype=np.float64)
+
+            (
+                sharpe_ratio,
+                final_total,
+                gross_pnl,
+                net_pnl,
+                max_drawdown,
+                n_trades,
+                total_commission,
+                n_out,
+            ) = simulate_mm_backtest(
+                low_np,
+                high_np,
+                close_np,
+                mid_np,
+                spread_np,
+                float(self.alpha),
+                float(self.beta),
+                float(self.gamma),
+                float(self.epsilon),
+                float(self.max_position),
+                float(self.position_qty),
+                float(self.commission_bps),
+                float(self.slippage_bps),
+                float(position_size),
+                float(bar_seconds),
+                1.0,
+                int(stride),
+                bool(store_curves),
+                pc,
+                rc,
+                uc,
+                tp,
+            )
+
+            if store_curves and n_out > 0:
+                results = {
+                    "bh_curve": bh_curve,
+                    "position_curve": pc[: int(n_out)].tolist(),
+                    "realized_pnl_curve": rc[: int(n_out)].tolist(),
+                    "unrealized_pnl_curve": uc[: int(n_out)].tolist(),
+                    "total_pnl_curve": tp[: int(n_out)].tolist(),
+                    "sharpe_ratio": float(sharpe_ratio),
+                    "final_pnl": float(final_total),
+                    "gross_pnl": float(gross_pnl),
+                    "net_pnl": float(net_pnl),
+                    "total_commission": float(total_commission),
+                    "n_trades": int(n_trades),
+                    "max_drawdown": float(max_drawdown),
+                }
+            else:
+                results = {
+                    "bh_curve": bh_curve,
+                    "position_curve": curves_empty,
+                    "realized_pnl_curve": curves_empty,
+                    "unrealized_pnl_curve": curves_empty,
+                    "total_pnl_curve": curves_empty,
+                    "sharpe_ratio": float(sharpe_ratio),
+                    "final_pnl": float(final_total),
+                    "gross_pnl": float(gross_pnl),
+                    "net_pnl": float(net_pnl),
+                    "total_commission": float(total_commission),
+                    "n_trades": int(n_trades),
+                    "max_drawdown": float(max_drawdown),
+                }
+            return results
+
+        if stride != 1:
+            raise ValueError(
+                "Python fallback run() поддерживает только stride==1 (используйте use_numba=True для stride>1)"
+            )
+
+        for i in range(n_all):
+            low = float(low_np[i])
+            high = float(high_np[i])
+            close = float(close_np[i])
+
             self.background_monitoring(low, high, close)
-            # 2. Отменяем старые ордеры
             self.cancel_old_orders()
-            # 3. Выставляем новые ордеры
-            self.place_new_orders(close, mid_predicts[i], spread_predicts[i])
+            self.place_new_orders(close, float(mid_np[i]), float(spread_np[i]))
 
-        # Метрики
         pnl_series = pd.Series(self.total_pnl_curve)
         returns = pnl_series.diff().dropna() / (position_size + 1e-12)
         periods_per_year = (365 * 24 * 60 * 60) / max(bar_seconds, 0.1)
@@ -365,32 +458,33 @@ class BacktestTrader(BaseTrader):
         if len(returns) > 1 and returns.std() > 0:
             sharpe_ratio = (returns.mean() / returns.std()) * np.sqrt(periods_per_year)
 
-        # Максимальная просадка по кривой total PnL
         cum = np.array(self.total_pnl_curve, dtype=float)
         running_max = np.maximum.accumulate(cum)
         drawdown = running_max - cum
         max_drawdown = float(np.max(drawdown)) if len(drawdown) else 0.0
 
-        gross_pnl = self.realized_pnl + (self.position * (ohlcv['close'].iloc[-1] - self.avg_entry_price) if self.position != 0 else 0.0)
+        last_close = float(close_np[-1])
+        gross_pnl = (
+            self.realized_pnl
+            + (self.position * (last_close - self.avg_entry_price) if self.position != 0 else 0.0)
+        )
         net_pnl = gross_pnl - self.total_commission
         final_total = self.total_pnl_curve[-1] if self.total_pnl_curve else 0.0
 
-        results = {
-            'bh_curve': bh_curve,
-            'position_curve': self.position_curve,
-            'realized_pnl_curve': self.realized_pnl_curve,
-            'unrealized_pnl_curve': self.unrealized_pnl_curve,
-            'total_pnl_curve': self.total_pnl_curve,
-            'sharpe_ratio': sharpe_ratio,
-            'final_pnl': final_total,
-            'gross_pnl': gross_pnl,
-            'net_pnl': net_pnl,
-            'total_commission': self.total_commission,
-            'n_trades': self.n_trades,
-            'max_drawdown': max_drawdown,
+        return {
+            "bh_curve": bh_curve,
+            "position_curve": self.position_curve,
+            "realized_pnl_curve": self.realized_pnl_curve,
+            "unrealized_pnl_curve": self.unrealized_pnl_curve,
+            "total_pnl_curve": self.total_pnl_curve,
+            "sharpe_ratio": sharpe_ratio,
+            "final_pnl": final_total,
+            "gross_pnl": gross_pnl,
+            "net_pnl": net_pnl,
+            "total_commission": self.total_commission,
+            "n_trades": self.n_trades,
+            "max_drawdown": max_drawdown,
         }
-        return results
-    
 
 
 def optimize_parameters(
@@ -455,21 +549,6 @@ def optimize_parameters(
 
 
 
-def objective(params, ohlcv, mid_predicts, spread_predicts, position_size, max_position, position_qty):
-    alpha, beta, gamma, epsilon = params
-    backtester = BacktestTrader(
-        alpha=alpha, beta=beta, gamma=gamma, epsilon=epsilon,
-        max_position=max_position, position_qty=position_qty
-    )
-    results = backtester.run(
-        ohlcv=ohlcv,
-        mid_predicts=mid_predicts,
-        spread_predicts=spread_predicts,
-        position_size=position_size,
-    )
-    # Минимизируем отрицательный Sharpe (gp_minimize ищет минимум)
-    return -results['sharpe_ratio']
-
 
 def optimize_parameters_fast(
     ohlcv: pd.DataFrame,
@@ -484,50 +563,286 @@ def optimize_parameters_fast(
     epsilon_range: Tuple[float, float] = (0.0, 10.0),
     n_calls: int = 300,
     n_initial_points: int = 50,
-):
-    try:
-        from skopt.space import Real
-        from skopt import gp_minimize
-    except ModuleNotFoundError as e:
-        raise ModuleNotFoundError(
-            "Для optimize_parameters_fast нужен scikit-optimize. Установите: pip install scikit-optimize"
-        ) from e
+    bar_seconds: float = 5.0,
+    commission_bps: float = 2.0,
+    slippage_bps: float = 0.0,
+    stride: int = 1,
+    method: str = "bayesian",
+    de_maxiter: int = 60,
+    de_popsize: int = 12,
+    de_workers: int = 1,
+    de_seed: int = 42,
+) -> Dict[str, Any]:
+    """
+    Подбирает (alpha,beta,gamma,epsilon), максимизируя Sharpe.
+    По умолчанию GP-Bayesian (scikit-optimize); симуляция через NumPy/Numba (без медленных .iloc в цикле).
 
-    # Определяем пространство поиска (сужаем на основе практики)
-    space = [
-        Real(alpha_range[0], alpha_range[1], name='alpha'),   # Spread scaling
-        Real(beta_range[0], beta_range[1], name='beta'),    # Directional component (часто мал)
-        Real(gamma_range[0], gamma_range[1], name='gamma'),   # Positional skew
-        Real(epsilon_range[0], epsilon_range[1], name='epsilon')  # PnL skew (часто мал)
+    method:
+      - 'bayesian' — gp_minimize (n_calls, n_initial_points)
+      - 'de' — scipy differential_evolution (параллель workers>1 возможен при скромном размере данных)
+    stride — прореживание баров только для этого поиска (метрики отличаются от полной выборки).
+    """
+    if not numba_available():
+        raise RuntimeError(
+            "optimize_parameters_fast требует numba-симулятор (pip install numba)."
+        )
+
+    lows = np.ascontiguousarray(ohlcv["low"].to_numpy(dtype=np.float64, copy=False))
+    highs = np.ascontiguousarray(ohlcv["high"].to_numpy(dtype=np.float64, copy=False))
+    closes = np.ascontiguousarray(ohlcv["close"].to_numpy(dtype=np.float64, copy=False))
+    mids = np.ascontiguousarray(np.asarray(mid_predicts, dtype=np.float64))
+    spreads = np.ascontiguousarray(np.asarray(spread_predicts, dtype=np.float64))
+    empty_curve = np.empty(0, dtype=np.float64)
+
+    def simulate_once(theta: Tuple[float, float, float, float]):
+        a, b, g, e = theta
+        sr, *_rest = simulate_mm_backtest(
+            lows,
+            highs,
+            closes,
+            mids,
+            spreads,
+            float(a),
+            float(b),
+            float(g),
+            float(e),
+            float(max_position),
+            float(position_qty),
+            float(commission_bps),
+            float(slippage_bps),
+            float(position_size),
+            float(bar_seconds),
+            1.0,
+            int(stride),
+            False,
+            empty_curve,
+            empty_curve,
+            empty_curve,
+            empty_curve,
+        )
+        return float(sr)
+
+    bayesian_bounds_skopt = [
+        alpha_range,
+        beta_range,
+        gamma_range,
+        epsilon_range,
     ]
 
-    # Фиксируем остальные параметры через partial
-    objective_partial = partial(
-        objective,
-        ohlcv=ohlcv,
-        mid_predicts=mid_predicts,
-        spread_predicts=spread_predicts,
-        position_size=position_size,
-        max_position=max_position,
-        position_qty=position_qty
+    base_out = {
+        "max_position": max_position,
+        "position_qty": position_qty,
+        "bar_seconds": bar_seconds,
+        "stride": stride,
+        "method": method,
+    }
+
+    method_l = method.lower().strip()
+
+    if method_l == "bayesian":
+        try:
+            from skopt.space import Real
+            from skopt import gp_minimize
+        except ModuleNotFoundError as e:
+            raise ModuleNotFoundError(
+                "method='bayesian' требует scikit-optimize: pip install scikit-optimize"
+            ) from e
+
+        space = [
+            Real(bayesian_bounds_skopt[0][0], bayesian_bounds_skopt[0][1], name="alpha"),
+            Real(bayesian_bounds_skopt[1][0], bayesian_bounds_skopt[1][1], name="beta"),
+            Real(bayesian_bounds_skopt[2][0], bayesian_bounds_skopt[2][1], name="gamma"),
+            Real(bayesian_bounds_skopt[3][0], bayesian_bounds_skopt[3][1], name="epsilon"),
+        ]
+
+        result = gp_minimize(
+            lambda xs: -simulate_once((float(xs[0]), float(xs[1]), float(xs[2]), float(xs[3]))),
+            space,
+            n_calls=int(n_calls),
+            n_initial_points=int(n_initial_points),
+            random_state=42,
+            verbose=True,
+        )
+        xv = tuple(float(v) for v in result.x)
+        best_sr = simulate_once(xv)
+
+        base_out.update(
+            {
+                "alpha": xv[0],
+                "beta": xv[1],
+                "gamma": xv[2],
+                "epsilon": xv[3],
+                "best_sharpe": best_sr,
+            }
+        )
+        return base_out
+
+    if method_l == "de":
+        try:
+            from scipy.optimize import differential_evolution
+        except ModuleNotFoundError as e:
+            raise ModuleNotFoundError(
+                "method='de' требует scipy: pip install scipy"
+            ) from e
+
+        bounds_scipy = [
+            tuple(bayesian_bounds_skopt[k]) for k in range(4)
+        ]
+
+        def de_obj(xx: np.ndarray) -> float:
+            return float(-simulate_once(tuple(map(float, xx))))
+
+        res = differential_evolution(
+            de_obj,
+            bounds_scipy,
+            maxiter=int(de_maxiter),
+            popsize=int(de_popsize),
+            polish=True,
+            workers=int(de_workers),
+            updating="deferred" if int(de_workers) != 1 else "immediate",
+            seed=int(de_seed),
+            strategy="best1bin",
+        )
+        xv = tuple(float(v) for v in res.x)
+        best_sr = simulate_once(xv)
+        base_out.update(
+            {
+                "alpha": xv[0],
+                "beta": xv[1],
+                "gamma": xv[2],
+                "epsilon": xv[3],
+                "best_sharpe": best_sr,
+                "de_nit": int(res.nit),
+                "de_nfev": int(res.nfev),
+                "success": bool(res.success),
+                "message": str(res.message),
+            }
+        )
+        return base_out
+
+    raise ValueError("Неизвестный method: используйте 'bayesian' или 'de'.")
+
+
+def optimize_parameters_pareto(
+    ohlcv: pd.DataFrame,
+    mid_predicts: np.ndarray,
+    spread_predicts: np.ndarray,
+    position_size: float = 100.0,
+    max_position: float = 0.02,
+    position_qty: float = 0.002,
+    alpha_range: Tuple[float, float] = (0.0, 10.0),
+    beta_range: Tuple[float, float] = (0.0, 10.0),
+    gamma_range: Tuple[float, float] = (0.0, 10.0),
+    epsilon_range: Tuple[float, float] = (0.0, 10.0),
+    *,
+    population_size: int = 80,
+    n_generations: int = 35,
+    bar_seconds: float = 5.0,
+    commission_bps: float = 2.0,
+    slippage_bps: float = 0.0,
+    stride: int = 1,
+    rng_seed: Optional[int] = 42,
+) -> Dict[str, Any]:
+    """
+    NSGA-II: Парето-фронт по двум целям (максимизация Sharpe И финальный total_pnl после прогона).
+    Внутри задачи переводится в минимизацию отрицаний двух показателей.
+    Требует numba-симулятор (см. mm_backtest_numba).
+    """
+    if not numba_available():
+        raise RuntimeError("optimize_parameters_pareto требует numba-симулятор.")
+
+    lows = np.ascontiguousarray(ohlcv["low"].to_numpy(dtype=np.float64, copy=False))
+    highs = np.ascontiguousarray(ohlcv["high"].to_numpy(dtype=np.float64, copy=False))
+    closes = np.ascontiguousarray(ohlcv["close"].to_numpy(dtype=np.float64, copy=False))
+    mids = np.ascontiguousarray(np.asarray(mid_predicts, dtype=np.float64))
+    spreads = np.ascontiguousarray(np.asarray(spread_predicts, dtype=np.float64))
+    empty_curve = np.empty(0, dtype=np.float64)
+
+    def eval_row(xx: np.ndarray) -> Tuple[float, float]:
+        row = xx.astype(np.float64, copy=False)
+        sr, fp, _gp, _net, _mdd, _ntr, _tcomm, _nsteps = simulate_mm_backtest(
+            lows,
+            highs,
+            closes,
+            mids,
+            spreads,
+            float(row[0]),
+            float(row[1]),
+            float(row[2]),
+            float(row[3]),
+            float(max_position),
+            float(position_qty),
+            float(commission_bps),
+            float(slippage_bps),
+            float(position_size),
+            float(bar_seconds),
+            1.0,
+            int(stride),
+            False,
+            empty_curve,
+            empty_curve,
+            empty_curve,
+            empty_curve,
+        )
+
+        sharpe_goal = sr
+        pnl_goal = fp
+        return float(sharpe_goal), float(pnl_goal)
+
+    def evaluate_population(pop_arr: np.ndarray) -> np.ndarray:
+        scores = np.empty((pop_arr.shape[0], 2), dtype=np.float64)
+        for i in range(pop_arr.shape[0]):
+            s, fp = eval_row(pop_arr[i])
+            scores[i, 0] = -s
+            scores[i, 1] = -fp
+        return scores
+
+    xl = np.asarray(
+        [alpha_range[0], beta_range[0], gamma_range[0], epsilon_range[0]],
+        dtype=np.float64,
+    )
+    xu = np.asarray(
+        [alpha_range[1], beta_range[1], gamma_range[1], epsilon_range[1]],
+        dtype=np.float64,
     )
 
-    # Bayesian optimization
-    result = gp_minimize(
-        objective_partial,
-        space,
-        n_calls=n_calls,
-        n_initial_points=n_initial_points,
-        random_state=42,
-        verbose=True
+    res = run_nsga2(
+        evaluate_population,
+        xl,
+        xu,
+        int(population_size),
+        int(n_generations),
+        seed=rng_seed,
     )
-    
+
+    solutions: List[Dict[str, float]] = []
+    for row, fv in zip(res.pareto_params, res.pareto_F):
+        xv = tuple(float(z) for z in row)
+        solutions.append(
+            {
+                "alpha": xv[0],
+                "beta": xv[1],
+                "gamma": xv[2],
+                "epsilon": xv[3],
+                "sharpe_ratio": float(-fv[0]),
+                "final_pnl": float(-fv[1]),
+                "max_position": float(max_position),
+                "position_qty": float(position_qty),
+            }
+        )
+
     return {
-        'alpha': result.x[0],
-        'beta': result.x[1],
-        'gamma': result.x[2],
-        'epsilon': result.x[3],
-        'max_position': max_position,
-        'position_qty': position_qty,
-        'best_sharpe': -result.fun,  # Возвращаем положительный Sharpe
+        "pareto_front": solutions,
+        "population_size": int(population_size),
+        "n_generations": int(n_generations),
+        "stride": stride,
+        "bar_seconds": bar_seconds,
+        "bounds": {
+            "alpha_range": tuple(map(float, alpha_range)),
+            "beta_range": tuple(map(float, beta_range)),
+            "gamma_range": tuple(map(float, gamma_range)),
+            "epsilon_range": tuple(map(float, epsilon_range)),
+        },
     }
+
+
